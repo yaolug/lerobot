@@ -15,6 +15,7 @@
 import json
 import pickle
 from pathlib import Path
+import argparse
 
 import torch
 
@@ -34,6 +35,12 @@ def display(tensor: torch.Tensor):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Compare PyTorch and JAX models")
+    parser.add_argument("--ckpt-torch-dir", type=str, help="Path to PyTorch checkpoint directory")
+    parser.add_argument("--ckpt-jax-dir", type=str, help="Path to JAX checkpoint directory")
+    parser.add_argument("--save-dir", type=str, help="Path to save directory")
+    args = parser.parse_args()
+
     num_motors = 14
     device = "cuda"
     # model_name = "pi0_aloha_towel"
@@ -44,9 +51,10 @@ def main():
     else:
         dataset_repo_id = "lerobot/aloha_sim_transfer_cube_human"
 
-    ckpt_torch_dir = Path.home() / f".cache/openpi/openpi-assets/checkpoints/{model_name}_pytorch"
-    ckpt_jax_dir = Path.home() / f".cache/openpi/openpi-assets/checkpoints/{model_name}"
-    save_dir = Path(f"../openpi/data/{model_name}/save")
+    # Use command line arguments or default values
+    ckpt_torch_dir = Path(args.ckpt_torch_dir) if args.ckpt_torch_dir else Path.home() / f".cache/openpi/openpi-assets/checkpoints/{model_name}_pytorch"
+    ckpt_jax_dir = Path(args.ckpt_jax_dir) if args.ckpt_jax_dir else Path.home() / f".cache/openpi/openpi-assets/checkpoints/{model_name}"
+    save_dir = Path(args.save_dir) if args.save_dir else Path(f"/home/jasonlu/workspace/openpi/data/{model_name}/save")
 
     with open(save_dir / "example.pkl", "rb") as f:
         example = pickle.load(f)
@@ -54,18 +62,37 @@ def main():
         outputs = pickle.load(f)
     with open(save_dir / "noise.pkl", "rb") as f:
         noise = pickle.load(f)
+    with open(save_dir / "processed_inputs.pkl", "rb") as f:
+        processed_inputs = pickle.load(f)
 
-    with open(ckpt_jax_dir / "assets/norm_stats.json") as f:
+    with open(ckpt_jax_dir / "assets/lerobot/aloha_sim_transfer_cube_human/norm_stats.json") as f:
         norm_stats = json.load(f)
 
     # Override stats
     dataset_meta = LeRobotDatasetMetadata(dataset_repo_id)
+    print("=== Stats Override ===")
+    print(f"Original dataset stats for observation.state:")
+    print(f"  mean: {dataset_meta.stats['observation.state']['mean']}")
+    print(f"  std: {dataset_meta.stats['observation.state']['std']}")
+
     dataset_meta.stats["observation.state"]["mean"] = torch.tensor(
         norm_stats["norm_stats"]["state"]["mean"][:num_motors], dtype=torch.float32
     )
     dataset_meta.stats["observation.state"]["std"] = torch.tensor(
         norm_stats["norm_stats"]["state"]["std"][:num_motors], dtype=torch.float32
     )
+    dataset_meta.stats["action"]["mean"] = torch.tensor(
+        norm_stats["norm_stats"]["actions"]["mean"][:num_motors], dtype=torch.float32
+    )
+    dataset_meta.stats["action"]["std"] = torch.tensor(
+        norm_stats["norm_stats"]["actions"]["std"][:num_motors], dtype=torch.float32
+    )
+
+
+    print(f"Overridden with JAX stats (first {num_motors} motors):")
+    print(f"  mean: {dataset_meta.stats['observation.state']['mean']}")
+    print(f"  std: {dataset_meta.stats['observation.state']['std']}")
+    print()
 
     # Create LeRobot batch from Jax
     batch = {}
@@ -95,7 +122,7 @@ def main():
         if isinstance(batch[k], torch.Tensor):
             batch[k] = batch[k].to(device=device, dtype=torch.float32)
 
-    noise = torch.from_numpy(noise).to(device=device, dtype=torch.float32)
+    noise = torch.from_numpy(noise).to(device=device, dtype=torch.float32).unsqueeze(0)
 
     from lerobot import policies  # noqa
 
@@ -103,15 +130,8 @@ def main():
     cfg.pretrained_path = ckpt_torch_dir
     policy = make_policy(cfg, dataset_meta)
 
-    # loss_dict = policy.forward(batch, noise=noise, time=time_beta)
-    # loss_dict["loss"].backward()
-    # print("losses")
-    # display(loss_dict["losses_after_forward"])
-    # print("pi_losses")
-    # display(pi_losses)
-
     actions = []
-    for _ in range(50):
+    for i in range(50):
         action = policy.select_action(batch, noise=noise)
         actions.append(action)
 
@@ -125,6 +145,18 @@ def main():
     print("atol=3e-2", torch.allclose(actions, pi_actions, atol=3e-2))
     print("atol=2e-2", torch.allclose(actions, pi_actions, atol=2e-2))
     print("atol=1e-2", torch.allclose(actions, pi_actions, atol=1e-2))
+
+    # Calculate max absolute error
+    abs_diff = torch.abs(actions - pi_actions)
+    max_abs_error = torch.max(abs_diff).item()
+    print(f"\nMax absolute error: {max_abs_error:.6f}")
+
+    # Calculate max relative error
+    # Add small epsilon to avoid division by zero
+    eps = 1e-8
+    rel_diff = abs_diff / (torch.abs(pi_actions) + eps)
+    max_rel_error = torch.max(rel_diff).item()
+    print(f"Max relative error: {max_rel_error:.6f}")
 
 
 if __name__ == "__main__":
