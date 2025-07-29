@@ -556,8 +556,12 @@ class PI0FlowMatching(nn.Module):
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        
+        # Get batch size from the first dimension of the concatenated tensors
+        bsize = pad_masks.shape[0]
+        
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
+        
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
@@ -595,6 +599,9 @@ class PI0FlowMatching(nn.Module):
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)  # swish == silu
         action_time_emb = self.action_time_mlp_out(action_time_emb)
+        
+        # Convert to bfloat16 to match state embeddings
+        action_time_emb = action_time_emb.to(dtype=torch.bfloat16)
 
         # Add to input tokens
         embs.append(action_time_emb)
@@ -638,8 +645,11 @@ class PI0FlowMatching(nn.Module):
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
+        # Add head dimension to attention mask: [B, seq_len, seq_len] -> [B, 1, seq_len, seq_len]
+        att_2d_masks_4d = att_2d_masks[:, None, :, :]
+
         (_, suffix_out), _ = self.paligemma_with_expert.forward(
-            attention_mask=att_2d_masks,
+            attention_mask=att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, suffix_embs],
@@ -670,8 +680,11 @@ class PI0FlowMatching(nn.Module):
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         # Compute image and language key value cache
+        # Add head dimension to attention mask: [B, seq_len, seq_len] -> [B, 1, seq_len, seq_len]
+        prefix_att_2d_masks_4d = prefix_att_2d_masks[:, None, :, :]
+        
         _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
+            attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
@@ -713,17 +726,36 @@ class PI0FlowMatching(nn.Module):
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
+        
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
 
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
+        # When using past_key_values, we need to account for the full sequence length
+        # The transformer expects attention mask to cover: past_key_values + new suffix tokens
+        # Adjust the attention mask to match the expected sequence length
+        if past_key_values is not None:
+            # Get the actual key length from past_key_values  
+            past_seq_len = past_key_values[0][0].shape[2]  # past_key_values[layer][key/value][batch, heads, seq_len, head_dim]
+            current_seq_len = full_att_2d_masks.shape[2]
+            expected_seq_len = past_seq_len + suffix_len
+            
+            if current_seq_len != expected_seq_len:
+                # Pad the attention mask to match expected length
+                pad_size = expected_seq_len - current_seq_len
+                padding = torch.ones(batch_size, suffix_len, pad_size, dtype=full_att_2d_masks.dtype, device=full_att_2d_masks.device)
+                full_att_2d_masks = torch.cat([full_att_2d_masks, padding], dim=2)
+
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
+        # Add head dimension to attention mask: [B, seq_len, seq_len] -> [B, 1, seq_len, seq_len]
+        full_att_2d_masks_4d = full_att_2d_masks[:, None, :, :]
+
         outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks,
+            attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],

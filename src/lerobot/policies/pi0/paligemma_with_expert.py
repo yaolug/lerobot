@@ -22,12 +22,25 @@ from transformers import (
     AutoConfig,
     GemmaForCausalLM,
     PaliGemmaForConditionalGeneration,
+    Gemma3ForConditionalGeneration,
     PretrainedConfig,
     PreTrainedModel,
 )
 from transformers.models.auto import CONFIG_MAPPING
 
 from lerobot.policies.pi0.flex_attention import flex_attention_forward
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 def apply_rope(x, positions, max_wavelength=10_000):
@@ -87,15 +100,20 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
                 projection_dim=2048,
                 text_config={
                     "hidden_activation": "gelu_pytorch_tanh",
-                    "hidden_size": 2048,
-                    "intermediate_size": 16384,
-                    "model_type": "gemma",
+                    "hidden_size": 2560,
+                    "intermediate_size": 10240,
+                    "model_type": "gemma3_text",
                     "num_attention_heads": 8,
-                    "num_hidden_layers": 18,
+                    "num_hidden_layers": 34,
                     "num_image_tokens": 256,
-                    "num_key_value_heads": 1,
+                    "num_key_value_heads": 4,
                     "torch_dtype": "float32",
                     "vocab_size": 257152,
+                    "rope_scaling": {
+                        "factor": 8.0,
+                        "rope_type": "linear"
+                        },
+                    "sliding_window": 1024
                 },
                 vision_config={
                     "hidden_size": 1152,
@@ -135,8 +153,8 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
                 max_position_embeddings=8192,
                 model_type="gemma",
                 num_attention_heads=8,
-                num_hidden_layers=18,
-                num_key_value_heads=1,
+                num_hidden_layers=34,
+                num_key_value_heads=4,
                 pad_token_id=0,
                 rms_norm_eps=1e-06,
                 rope_theta=10000.0,
@@ -174,7 +192,9 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
     def __init__(self, config: PaliGemmaWithExpertConfig):
         super().__init__(config=config)
         self.config = config
-        self.paligemma = PaliGemmaForConditionalGeneration(config=config.paligemma_config)
+        #self.paligemma = PaliGemmaForConditionalGeneration(config=config.paligemma_config)
+        self.paligemma = Gemma3ForConditionalGeneration.from_pretrained("TODO Yao Lu")
+        self.paligemma.vision_tower.position_embedding = nn.Embedding(1024, 1152)
         self.gemma_expert = GemmaForCausalLM(config=config.gemma_expert_config)
         # Remove unused embed_tokens
         self.gemma_expert.model.embed_tokens = None
@@ -235,187 +255,21 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         use_cache: Optional[bool] = None,
         fill_kv_cache: Optional[bool] = None,
     ):
-        models = [self.paligemma.language_model, self.gemma_expert.model]
-
-        for hidden_states in inputs_embeds:
-            # TODO this is very inefficient
-            # dtype is always the same, batch size too (if > 1 len)
-            # device could be trickier in multi gpu edge cases but that's it
-            if hidden_states is None:
-                continue
-            batch_size = hidden_states.shape[0]
-
-        # RMSNorm
-        num_layers = self.paligemma.config.text_config.num_hidden_layers
-        head_dim = self.paligemma.config.text_config.head_dim
-        for layer_idx in range(num_layers):
-            query_states = []
-            key_states = []
-            value_states = []
-            for i, hidden_states in enumerate(inputs_embeds):
-                if hidden_states is None:
-                    continue
-                layer = models[i].layers[layer_idx]
-                # normalizer = torch.tensor(models[i].config.hidden_size**0.5, dtype=hidden_states.dtype)
-                # hidden_states = hidden_states * normalizer
-                hidden_states = layer.input_layernorm(hidden_states)
-
-                input_shape = hidden_states.shape[:-1]
-                hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-
-                hidden_states = hidden_states.to(dtype=torch.bfloat16)
-                query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
-                key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
-                value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
-
-                query_states.append(query_state)
-                key_states.append(key_state)
-                value_states.append(value_state)
-
-            # B,L,H,D with L sequence length, H number of heads, D head dim
-            # concatenate on the number of embeddings/tokens
-            query_states = torch.cat(query_states, dim=1)
-            key_states = torch.cat(key_states, dim=1)
-            value_states = torch.cat(value_states, dim=1)
-
-            query_states = apply_rope(query_states, position_ids)
-            key_states = apply_rope(key_states, position_ids)
-
-            if use_cache and past_key_values is None:
-                past_key_values = {}
-
-            if use_cache:
-                if fill_kv_cache:
-                    past_key_values[layer_idx] = {
-                        "key_states": key_states,
-                        "value_states": value_states,
-                    }
-                else:
-                    # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
-                    # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
-                    # the max len, then we (for instance) double the cache size. This implementation already exists
-                    # in `transformers`. (molbap)
-                    key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
-                    value_states = torch.cat(
-                        [past_key_values[layer_idx]["value_states"], value_states], dim=1
-                    )
-
-            attention_interface = self.get_attention_interface()
-            att_output = attention_interface(
-                attention_mask, batch_size, head_dim, query_states, key_states, value_states
+        if inputs_embeds[0] is None:
+            output = self.gemma_expert.model.forward(
+                inputs_embeds=inputs_embeds[1],
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
             )
-            att_output = att_output.to(dtype=torch.bfloat16)
-
-            # first part of att_output is prefix (up to sequence length, [:, 0:prefix_seq_len])
-            outputs_embeds = []
-            start = 0
-            for i, hidden_states in enumerate(inputs_embeds):
-                layer = models[i].layers[layer_idx]
-
-                if hidden_states is not None:
-                    end = start + hidden_states.shape[1]
-
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                    out_emb = layer.self_attn.o_proj(att_output[:, start:end])
-
-                    # TODO: first dropout (by default 0.0)
-
-                    # first residual
-                    out_emb += hidden_states
-                    after_first_residual = out_emb.clone()
-
-                    out_emb = layer.post_attention_layernorm(out_emb)
-                    out_emb = layer.mlp(out_emb)
-
-                    # TODO: second dropout (by default 0.0)
-
-                    # second residual
-                    out_emb += after_first_residual
-
-                    outputs_embeds.append(out_emb)
-
-                    start = end
-                else:
-                    outputs_embeds.append(None)
-
-            inputs_embeds = outputs_embeds
-
-        # final norm
-        outputs_embeds = []
-        for i, hidden_states in enumerate(inputs_embeds):
-            if hidden_states is not None:
-                out_emb = models[i].norm(hidden_states)
-                outputs_embeds.append(out_emb)
-            else:
-                outputs_embeds.append(None)
-
-        return outputs_embeds, past_key_values
-
-    def get_attention_interface(self):
-        if self.config.attention_implementation == "fa2":
-            attention_interface = self.flash_attention_forward
-        elif self.config.attention_implementation == "flex":
-            attention_interface = flex_attention_forward
-        else:
-            attention_interface = self.eager_attention_forward
-        return attention_interface
-
-    def flash_attention_forward(
-        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
-    ):
-        raise NotImplementedError("FA2 is not implemented (yet)")
-
-    def eager_attention_forward(
-        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
-    ):
-        num_att_heads = self.config.paligemma_config.text_config.num_attention_heads
-        num_key_value_heads = self.config.paligemma_config.text_config.num_key_value_heads
-        num_key_value_groups = num_att_heads // num_key_value_heads
-
-        # query_states: batch_size, sequence_length, num_att_head, head_dim
-        # key_states: batch_size, sequence_length, num_key_value_head, head_dim
-        # value_states: batch_size, sequence_length, num_key_value_head, head_dim
-        sequence_length = key_states.shape[1]
-
-        key_states = key_states[:, :, :, None, :].expand(
-            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
-        )
-        key_states = key_states.reshape(
-            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
-        )
-
-        value_states = value_states[:, :, :, None, :].expand(
-            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
-        )
-        value_states = value_states.reshape(
-            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
-        )
-
-        # Attention here is upcasted to float32 to match the original eager implementation.
-
-        query_states = query_states.to(dtype=torch.float32)
-        key_states = key_states.to(dtype=torch.float32)
-
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-
-        att_weights = torch.matmul(query_states, key_states.transpose(2, 3))
-        att_weights *= head_dim**-0.5
-        big_neg = -2.3819763e38  # See gemma/modules.py
-
-        masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
-
-        probs = nn.functional.softmax(masked_att_weights, dim=-1)
-        probs = probs.to(dtype=value_states.dtype)
-
-        # probs: batch_size, num_key_value_head, num_att_head, sequence_length, sequence_length
-        # value_states: batch_size, sequence_length, num_att_heads, head_dim
-
-        att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))
-
-        att_output = att_output.permute(0, 2, 1, 3)
-        # we use -1 because sequence length can change
-        att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
-
-        return att_output
+            return [None, output.last_hidden_state], output.past_key_values
+        elif inputs_embeds[1] is None:
+            output = self.paligemma.language_model.forward(
+                inputs_embeds=inputs_embeds[0],
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+            return [output.last_hidden_state, None], output.past_key_values

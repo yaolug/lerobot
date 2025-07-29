@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+
 import os
 import time
 from pathlib import Path
@@ -183,6 +184,8 @@ def main():
     cfg = PI0Config(
         n_action_steps=1,
         empty_cameras=2,
+        #num_steps=5,
+        resize_imgs_with_padding=(448, 448)
     )
     print(cfg)
     
